@@ -92,7 +92,9 @@ class Glm53VisionRotaryEmbedding(nn.Module):
         self.head_dim = head_dim
         self.theta = theta
         spatial_dim = head_dim // 2
-        inv_freq = 1.0 / (theta ** (torch.arange(0, spatial_dim, 2, dtype=torch.float) / spatial_dim))
+        # Keep this non-persistent buffer real even when parameters are built on meta.
+        # HF loading cannot restore it after to_empty(), since it is absent from the checkpoint.
+        inv_freq = 1.0 / (theta ** (torch.arange(0, spatial_dim, 2, dtype=torch.float, device="cpu") / spatial_dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
     def forward(self, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

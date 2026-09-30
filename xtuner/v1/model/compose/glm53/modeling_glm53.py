@@ -185,19 +185,45 @@ class Glm53ForConditionalGeneration(BaseComposeModel):
         # this rank's slice, split alongside input_ids; `_splice` reconciles it with the features.
         mm_token_type_ids = seq_ctx.mm_token_type_ids
 
-        # A *sample* never mixes image and video -- the tokenize fn rejects that (F1.b) -- but a
-        # *pack* routinely holds an image sample next to a video sample, and this is the pack.
-        # Each modality is spliced onto its own positions (mm_token_type_ids 1 vs 2), so the two
-        # are independent and both run when both are present.
+        # All FSDP ranks must call the vision tower/projector exactly once per microbatch,
+        # including ranks whose pack contains both image and video samples. Attention remains
+        # segmented by grid rows, so concatenating their patches does not mix their attention.
+        pixels, grids, modalities = [], [], []
+        merge_unit = self.vision_tower.spatial_merge_size**2
         if has_image:
             assert seq_ctx.image_grid_thw is not None
-            features = self.get_visual_features(seq_ctx.pixel_values, seq_ctx.image_grid_thw, sp_mesh)  # type: ignore[arg-type]
-            inputs_embeds = self._splice(inputs_embeds, mm_token_type_ids, 1, features, sp_mesh)
+            pixels.append(seq_ctx.pixel_values)
+            grids.append(seq_ctx.image_grid_thw)
+            modalities.append((1, seq_ctx.pixel_values.shape[0] // merge_unit))
         if has_video:
             assert seq_ctx.video_grid_thw is not None
-            flat_grid_thw = flatten_video_grid_thw(seq_ctx.video_grid_thw)
-            features = self.get_visual_features(seq_ctx.pixel_values_videos, flat_grid_thw, sp_mesh)  # type: ignore[arg-type]
-            inputs_embeds = self._splice(inputs_embeds, mm_token_type_ids, 2, features, sp_mesh)
+            pixels.append(seq_ctx.pixel_values_videos)
+            grids.append(flatten_video_grid_thw(seq_ctx.video_grid_thw))
+            modalities.append((2, seq_ctx.pixel_values_videos.shape[0] // merge_unit))
+
+        features = self.get_visual_features(torch.cat(pixels), torch.cat(grids), sp_mesh)
+        use_sp = sp_mesh is not None and sp_mesh.size() > 1
+        if use_sp:
+            # Gather the combined stream before splitting it by modality: an SP shard may
+            # straddle the image/video boundary, and padding belongs to the combined stream.
+            features = self._gather_visual_features(features, sum(n for _, n in modalities), sp_mesh)
+        offset = 0
+        for modality, count in modalities:
+            modality_features = features[offset : offset + count]
+            offset += count
+            global_types, local_slice = (
+                self._local_feature_slice(mm_token_type_ids, modality, sp_mesh)
+                if use_sp else (mm_token_type_ids, slice(None))
+            )
+            n_tokens = int((global_types == modality).sum().item())
+            if n_tokens != count:
+                raise ValueError(
+                    f"GLM-5.3-Flash modality={modality} placeholder count {n_tokens} != visual feature "
+                    f"count {count}. Refusing to continue training on a corrupted splice."
+                )
+            inputs_embeds = self._splice(
+                inputs_embeds, mm_token_type_ids, modality, modality_features[local_slice]
+            )
         return inputs_embeds
 
     def forward(
