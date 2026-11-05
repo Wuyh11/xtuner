@@ -24,6 +24,8 @@ from xtuner.v1.rl.agent_loop.sandbox_agent_loop.hooks import (
     UploadHook,
 )
 from xtuner.v1.rl.agent_loop.sandbox_agent_loop.judger import Judger
+from xtuner.v1.rl.agent_loop.sandbox_agent_loop.memory import SandboxMemory
+from xtuner.v1.rl.agent_loop.sandbox_agent_loop.resource_policy import MemoryFailurePolicy
 from xtuner.v1.rl.agent_loop.sandbox_agent_loop.runner import Runner
 from xtuner.v1.rl.agent_loop.sandbox_agent_loop.sandbox import (
     DetachedShellEntry,
@@ -63,6 +65,7 @@ __all__ = [
     "Hook",
     "InstallLagent",
     "Judger",
+    "MemoryFailurePolicy",
     "ParseJudgerStdout",
     "PickAgent",
     "ReadFileHook",
@@ -71,6 +74,7 @@ __all__ = [
     "RunAgentInstallDeps",
     "Runner",
     "SandboxPool",
+    "SandboxMemory",
     "SandboxSpec",
     "SandboxStage",
     "ShellEntry",

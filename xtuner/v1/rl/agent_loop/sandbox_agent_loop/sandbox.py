@@ -41,6 +41,7 @@ from lagent.utils.rate_limiter import get_shared_async_token_bucket
 
 from xtuner.v1.rl.agent_loop.sandbox_agent_loop.deadline import CancellationGuard
 from xtuner.v1.rl.agent_loop.sandbox_agent_loop.finalization import CleanupError, finalize_bounded
+from xtuner.v1.rl.agent_loop.sandbox_agent_loop.memory import SandboxMemory
 from xtuner.v1.rl.agent_loop.sandbox_agent_loop.schemas import (
     AgentRolloutItem,
     EntryOutcome,
@@ -224,12 +225,22 @@ class ShellEntry:
         timeout: int = 600,
         env: dict[str, str] | None = None,
         failure: EntryFailurePolicy | dict[str, Any] | None = None,
+        memory: SandboxMemory | dict[str, Any] | None = None,
     ):
         self.cmd = cmd
         self.name = name
         self.timeout = timeout
         self.env = dict(env or {})
         self.failure = create_object(failure) if failure is not None else None
+        self.memory = (
+            create_object(memory)
+            if isinstance(memory, dict) and "type" in memory
+            else SandboxMemory(**memory)
+            if isinstance(memory, dict)
+            else memory
+        )
+        if self.memory is not None and not isinstance(self.memory, SandboxMemory):
+            raise TypeError("memory must be a SandboxMemory configuration")
 
     async def run(
         self,
@@ -244,7 +255,18 @@ class ShellEntry:
         uid_obs = str(item.uid) if item.uid is not None else ""
         with span(uid_obs, f"entry:{self.name}", entry_kind="ShellEntry"):
             try:
-                outcome = await self._execute(client, self.env)
+                command, report = self.cmd, None
+                if self.memory is not None:
+                    command, report = await self.memory.prepare(
+                        client,
+                        command=_expand_vars(self.cmd, self.env) if self.env else self.cmd,
+                        env=self.env,
+                        timeout=self.timeout,
+                        entry_id=entry.id,
+                    )
+                outcome = await self._execute(client, {} if report else self.env, command=command)
+                if report is not None:
+                    outcome = await self.memory.classify(client, item, record, entry, outcome, report)
                 if not outcome.ok and self.failure is not None:
                     outcome = await self.failure.handle(client, item, record, entry, outcome)
                 self._finish_record(entry, outcome)
@@ -261,12 +283,12 @@ class ShellEntry:
                 self._finish_record(entry, outcome, exc=exc)
                 raise
 
-    async def _execute(self, client: Any, env: dict[str, str]) -> EntryOutcome:
+    async def _execute(self, client: Any, env: dict[str, str], command: str | None = None) -> EntryOutcome:
         exec_res = await exec_in(
             client,
-            self.cmd,
+            command if command is not None else self.cmd,
             env=env,
-            timeout_sec=self.timeout,
+            timeout_sec=self.timeout + (15 if self.memory is not None else 0),
             raise_on_error=False,
         )
         rc = _result_code(exec_res)
@@ -332,6 +354,7 @@ class DetachedShellEntry:
         env: dict[str, str] | None = None,
         capture: EntryCapture | dict[str, Any],
         failure: EntryFailurePolicy | dict[str, Any] | None = None,
+        memory: SandboxMemory | dict[str, Any] | None = None,
         handshake_timeout_sec: float = 60.0,
         poll_interval_sec: float = 60.0,
         pid_check_max_failures: int = 3,
@@ -347,6 +370,15 @@ class DetachedShellEntry:
         self.timeout = timeout
         self.env = dict(env or {})
         self.failure = create_object(failure) if failure is not None else None
+        self.memory = (
+            create_object(memory)
+            if isinstance(memory, dict) and "type" in memory
+            else SandboxMemory(**memory)
+            if isinstance(memory, dict)
+            else memory
+        )
+        if self.memory is not None and not isinstance(self.memory, SandboxMemory):
+            raise TypeError("memory must be a SandboxMemory configuration")
         self.capture = create_object(capture)
         self.handshake_timeout_sec = handshake_timeout_sec
         self.poll_interval_sec = poll_interval_sec
@@ -374,9 +406,20 @@ class DetachedShellEntry:
         uid_obs = str(item.uid) if item.uid is not None else ""
         with span(uid_obs, f"entry:{self.name}", entry_kind="DetachedShellEntry"):
             try:
-                outcome = await self._run_detached(client, item, entry, self.env)
+                command, report = self.cmd, None
+                if self.memory is not None:
+                    command, report = await self.memory.prepare(
+                        client,
+                        command=_expand_vars(self.cmd, self.env) if self.env else self.cmd,
+                        env=self.env,
+                        timeout=self.timeout,
+                        entry_id=entry.id,
+                    )
+                outcome = await self._run_detached(client, item, entry, {} if report else self.env, command=command)
                 if outcome.reason != "sandbox_unavailable":
                     await self._fill_output_files(client, entry, outcome.result)
+                if report is not None:
+                    outcome = await self.memory.classify(client, item, record, entry, outcome, report)
                 if not outcome.ok and self.failure is not None:
                     outcome = await self.failure.handle(client, item, record, entry, outcome)
                 self._finish_record(entry, outcome)
@@ -410,6 +453,7 @@ class DetachedShellEntry:
         item: AgentRolloutItem,
         entry: EntryRecord,
         env: dict[str, str],
+        command: str | None = None,
     ) -> EntryOutcome:
         assert entry.rc_file and entry.stdout_file and entry.stderr_file
         rc_file = shlex.quote(entry.rc_file)
@@ -417,7 +461,7 @@ class DetachedShellEntry:
         stderr_file = shlex.quote(entry.stderr_file)
         wrapped = (
             f"rm -f {rc_file} {stdout_file} {stderr_file}; "
-            f"({self.cmd}) > {stdout_file} 2> {stderr_file}; "
+            f"({command if command is not None else self.cmd}) > {stdout_file} 2> {stderr_file}; "
             f"rc=$?; "
             f"printf '%s\\n' \"$rc\" > {rc_file}; "
             f'exit "$rc"'
@@ -442,7 +486,7 @@ class DetachedShellEntry:
         pid: int,
     ) -> EntryOutcome:
         is_pid_running = client.is_pid_running
-        deadline = time.monotonic() + self.timeout
+        deadline = time.monotonic() + self.timeout + (15 if self.memory is not None else 0)
         poll = max(0.2, self.poll_interval_sec)
         polls = 0
         last_error: str | None = None
