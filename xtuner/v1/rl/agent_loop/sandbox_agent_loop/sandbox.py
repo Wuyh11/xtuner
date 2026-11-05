@@ -56,6 +56,26 @@ from xtuner.v1.rl.agent_loop.sandbox_agent_loop.trace import span
 from xtuner.v1.utils import get_logger
 
 
+# Lowercased provider lifecycle states in which a sandbox's processes can no
+# longer be observed or resumed. Monitors stop waiting in these states, and
+# callers must not treat a failed in-sandbox command as recoverable.
+SANDBOX_TERMINAL_STATES = frozenset(
+    {
+        "error",
+        "failed",
+        "deleted",
+        "deleting",
+        "expired",
+        "stopped",
+        "stopping",
+        "terminated",
+        "terminating",
+        "completed",
+        "succeeded",
+        "paused",
+    }
+)
+
 # ─────────────────────────────────────────────────────────────────
 # Hook base
 # ─────────────────────────────────────────────────────────────────
@@ -543,20 +563,7 @@ class DetachedShellEntry:
                         )
                     except (httpx.HTTPError, RuntimeError, TimeoutError):
                         pass  # Failure to observe state never proves termination.
-                terminal = sandbox_state in {
-                    "error",
-                    "failed",
-                    "deleted",
-                    "deleting",
-                    "expired",
-                    "stopped",
-                    "stopping",
-                    "terminated",
-                    "terminating",
-                    "completed",
-                    "succeeded",
-                    "paused",
-                }
+                terminal = sandbox_state in SANDBOX_TERMINAL_STATES
                 last_failure = {
                     "sandbox_state": sandbox_state,
                     "transport_status": getattr(exc, "status_code", None),
@@ -670,20 +677,12 @@ class DetachedShellEntry:
             if sleep_sec > 0:
                 await asyncio.sleep(sleep_sec)
 
-        # A healthy process observation permits the normal final rc check.
-        # An exhausted recovery window must not initiate another control RPC.
-        remaining = deadline - time.monotonic()
-        rc = (
-            await self._wait_int_capture_file(
-                client,
-                entry.rc_file,
-                timeout_sec=remaining,
-                poll_interval_sec=self.rc_poll_interval_sec,
-                deadline=deadline,
-            )
-            if last_error is None and remaining > 0
-            else None
-        )
+        # A healthy process observation permits one final rc check: the process
+        # may have exited between the last poll and the deadline. The loop only
+        # exits after the deadline, so this read must not depend on remaining
+        # time; _read_capture_file bounds it. An exhausted recovery window must
+        # not initiate another control RPC.
+        rc = await self._read_int_capture_file(client, entry.rc_file) if last_error is None else None
         if rc is not None:
             return _entry_completed_outcome(
                 source="detach_exec",

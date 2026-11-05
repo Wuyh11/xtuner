@@ -186,8 +186,10 @@ class Runner:
             try:
                 await pool.release_all()
             except CleanupError as exc:
+                # release_all raises only when no primary error is propagating.
+                # Keep run()'s contract of returning the item: mark it failed
+                # (its reward must not be trained on) and keep pool.cleanup.
                 self._fail(item, RolloutError(stage="cleanup", category=exc.kind, message=str(exc)))
-                raise
             finally:
                 item.artifacts["sandbox_cleanup"] = pool.cleanup
                 self._log_final(tid, item, t_acquire, t_infer, t_validate)

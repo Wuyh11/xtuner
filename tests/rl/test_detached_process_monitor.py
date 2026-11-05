@@ -113,6 +113,21 @@ class MonitorTests(unittest.IsolatedAsyncioTestCase):
         outcome=await self.run_monitor(entry,client)
         self.assertEqual(outcome.reason,'timeout')
 
+    async def test_exit_between_last_poll_and_deadline_uses_final_rc(self):
+        # The process is alive at the only poll, then exits and writes rc before
+        # the deadline; the next poll would come after the deadline.
+        entry=self.entry()
+        entry.timeout=.05
+        entry.poll_interval_sec=10
+        entry._read_int_capture_file.return_value=0
+        client=SimpleNamespace(is_pid_running=AsyncMock(return_value=True))
+        outcome=await self.run_monitor(entry,client)
+        self.assertTrue(outcome.ok)
+        self.assertEqual(outcome.result.return_code,0)
+        self.assertTrue(outcome.details['timeout_with_rc'])
+        self.assertEqual(client.is_pid_running.await_count,1)
+        entry._read_int_capture_file.assert_awaited_once()
+
     async def test_deleting_lifecycle_is_terminal_and_never_confused_with_process_exit(self):
         entry=self.entry()
         client=SimpleNamespace(is_pid_running=AsyncMock(side_effect=httpx.ReadTimeout('private URL')),

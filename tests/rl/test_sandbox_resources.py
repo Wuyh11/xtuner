@@ -138,3 +138,30 @@ class TestMemoryFailurePolicy:
                 client, SimpleNamespace(artifacts={}), StageRecord(), entry, outcome
             )
             assert result.reason == reason
+
+
+class TestRunGuardedTeardown:
+    def test_failed_cgroup_termination_still_runs_cleanup_and_reports_exit(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from xtuner.v1.rl.agent_loop.sandbox_agent_loop import resource_guard
+
+        def stuck(guard: object, timeout: float = 10) -> None:
+            raise RuntimeError("Workload cgroup termination was not confirmed")
+
+        reports: list[dict] = []
+        guard = SimpleNamespace(enter_child=lambda: None, report=lambda **kwargs: reports.append(kwargs))
+        cleanups: list[bool] = []
+        monkeypatch.setattr(resource_guard, "stop_workload", stuck)
+        with pytest.raises(RuntimeError, match="not confirmed"):
+            resource_guard.run_guarded(
+                ["/bin/sh", "-c", "exit 3"],
+                guard=guard,  # type: ignore[arg-type]
+                timeout_seconds=10,
+                prepare_child=lambda: None,
+                cleanup=lambda: cleanups.append(True),
+            )
+        assert cleanups == [True]
+        assert reports == [
+            {"return_code": 3, "timed_out": False, "cancelled": False, "termination_error": "RuntimeError"}
+        ]

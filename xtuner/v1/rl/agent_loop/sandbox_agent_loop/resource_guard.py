@@ -9,6 +9,7 @@ import math
 import os
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -125,6 +126,7 @@ class AgentMemoryGuard:
         timed_out: bool = False,
         cancelled: bool = False,
         path: str | Path | None = None,
+        termination_error: str | None = None,
     ) -> dict[str, Any]:
         """Atomically write supervisor-observed events after workload termination.
 
@@ -144,6 +146,7 @@ class AgentMemoryGuard:
             "return_code": return_code,
             "timed_out": timed_out,
             "cancelled": cancelled,
+            "termination_error": termination_error,
         }
         target = Path(path) if path is not None else self.report_path
         # The report lives in the root-owned runtime directory, not the agent's logs.
@@ -299,18 +302,33 @@ def run_guarded(
             result = 128 - result
         return result
     finally:
-        try:
-            stop_workload(guard)
-            if cleanup is not None:
-                cleanup()
-            if child is not None:
-                child.wait(timeout=3)
-        finally:
+        # Each teardown step runs even if an earlier one fails: a process stuck
+        # in the cgroup must not skip the task's own cleanup, the reap, or the
+        # report that preserves the observed exit code.
+        primary_exception = sys.exc_info()[1]
+        steps: list[Callable[[], Any]] = [lambda: stop_workload(guard)]
+        if cleanup is not None:
+            steps.append(cleanup)
+        if child is not None:
+            steps.append(lambda: child.wait(timeout=3))
+        errors: list[Exception] = []
+        for step in steps:
             try:
-                guard.report(return_code=result, timed_out=timed_out, cancelled=interrupted)
-            finally:
-                for sig, handler in handlers.items():
-                    signal.signal(sig, handler)
+                step()
+            except Exception as exc:
+                errors.append(exc)
+        try:
+            guard.report(
+                return_code=result,
+                timed_out=timed_out,
+                cancelled=interrupted,
+                termination_error=type(errors[0]).__name__ if errors else None,
+            )
+        finally:
+            for sig, handler in handlers.items():
+                signal.signal(sig, handler)
+        if errors and primary_exception is None:
+            raise errors[0]
 
 
 def main() -> int:

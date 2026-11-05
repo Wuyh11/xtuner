@@ -12,7 +12,7 @@ from xtuner.v1.rl.agent_loop.sandbox_agent_loop.finalization import CleanupError
 from xtuner.v1.rl.agent_loop.sandbox_agent_loop.judger import Judger
 from xtuner.v1.rl.agent_loop.sandbox_agent_loop.runner import Runner
 from xtuner.v1.rl.agent_loop.sandbox_agent_loop.sandbox import SandboxPool, SandboxStage
-from xtuner.v1.rl.agent_loop.sandbox_agent_loop.schemas import AgentRolloutItem, SandboxSpec
+from xtuner.v1.rl.agent_loop.sandbox_agent_loop.schemas import AgentRolloutItem, RolloutStatus, SandboxSpec
 
 
 class Provider:
@@ -185,10 +185,11 @@ class TestSharedRunner:
         runner = Runner(
             pool=pool, infer=SandboxStage(), validate=Judger("score", SandboxStage(post=[score])), timeout_sec=5
         )
-        item = make_item()
-        with pytest.raises(CleanupError):
-            await runner.run(item)
+        # A scored rollout whose cleanup fails is returned as failed, not raised.
+        item = await runner.run(make_item())
+        assert item.status == RolloutStatus.FAILED
         assert item.error.category == "cleanup_timeout"
+        assert not item.artifacts["sandbox_cleanup"]["ok"]
         assert not item.artifacts["sandbox_run_timing"]["deadline_expired"]
         assert item.artifacts["sandbox_cleanup"]["resources_deleted"]
         provider.close_gate.set()
