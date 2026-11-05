@@ -12,6 +12,8 @@ lagent-style runner config (``dict(type=Runner, ...)``), plus
 
 from __future__ import annotations
 
+import asyncio
+import math
 import time
 import traceback
 from copy import deepcopy
@@ -19,6 +21,8 @@ from typing import Any
 
 from lagent.utils import create_object
 
+from xtuner.v1.rl.agent_loop.sandbox_agent_loop.deadline import CancellationGuard, RunDeadline
+from xtuner.v1.rl.agent_loop.sandbox_agent_loop.finalization import CleanupError
 from xtuner.v1.rl.agent_loop.sandbox_agent_loop.judger import Judger
 from xtuner.v1.rl.agent_loop.sandbox_agent_loop.sandbox import SandboxPool, SandboxStage
 from xtuner.v1.rl.agent_loop.sandbox_agent_loop.schemas import (
@@ -40,16 +44,51 @@ class Runner:
         pool: SandboxPool | dict[str, Any],
         infer: SandboxStage | dict[str, Any],
         validate: Judger | dict[str, Any],
+        timeout_sec: float | None = None,
     ):
         # ``pool`` is stored as a *template*: pass a dict for normal use (a
         # fresh SandboxPool is built per ``run`` call), or pass an already-built
         # SandboxPool for one-shot reuse (testing).  Sharing one SandboxPool
         # instance across concurrent ``run`` calls is unsafe.
+        if timeout_sec is not None and (not math.isfinite(timeout_sec) or timeout_sec <= 0):
+            raise ValueError("timeout_sec must be finite and positive")
+        self.timeout_sec = timeout_sec
         self._pool = pool
         self.infer = create_object(infer)
         self.validate = create_object(validate)
 
     async def run(self, item: AgentRolloutItem) -> AgentRolloutItem:
+        """Run a sample, with an optional total deadline and bounded cleanup.
+
+        Returns:
+            AgentRolloutItem: The input item with result fields filled.
+        """
+        started = time.monotonic()
+        deadline = RunDeadline(started + self.timeout_sec if self.timeout_sec is not None else None)
+        try:
+            async with deadline:
+                return await self._run(item)
+        except asyncio.CancelledError:
+            if item.error is not None:
+                item.artifacts["error_before_cancellation"] = item.error.model_dump(mode="json")
+            item.error = RolloutError(stage="runner", category="rollout_cancelled", message="Rollout cancelled")
+            self._fail(item, item.error)
+            raise
+        except TimeoutError:
+            if not deadline.expired():
+                raise
+            if item.error is not None:
+                item.artifacts["error_before_timeout"] = item.error.model_dump(mode="json")
+            item.error = RolloutError(stage="runner", category="trial_timeout", message="Run deadline expired")
+            return self._fail(item, item.error)
+        finally:
+            item.artifacts["sandbox_run_timing"] = {
+                "budget_seconds": self.timeout_sec,
+                "deadline_expired": deadline.expired(),
+                "elapsed_seconds": time.monotonic() - started,
+            }
+
+    async def _run(self, item: AgentRolloutItem) -> AgentRolloutItem:
         """Run one rollout sample and return the same item with result fields
         filled.
 
@@ -58,6 +97,7 @@ class Runner:
         and promotes the first stage error to ``item.error`` when something
         fails.
         """
+        cancellation = CancellationGuard()
         self._validate_input(item)
         if isinstance(self._pool, SandboxPool):
             if item.pipeline_overrides:
@@ -88,6 +128,7 @@ class Runner:
                 t0 = time.monotonic()
                 with span(uid_obs, "acquire", task_id=tid) as acquire_span:
                     infer_client = await pool.get(infer_sandbox, record=item.infer)
+                    cancellation.check()
                     item.infer.sandbox_env_id = pool.env_id(infer_sandbox)
                     sandbox_url = pool.url(infer_sandbox)
                     if sandbox_url is not None:
@@ -104,6 +145,7 @@ class Runner:
                 t1 = time.monotonic()
                 with span(uid_obs, "infer", task_id=tid) as infer_span:
                     infer_result = await self.infer.run(infer_client, item, item.infer)
+                    cancellation.check()
                     if not infer_result.ok:
                         infer_span.mark_error(_format_error(item.infer.error))
                 t_infer = time.monotonic() - t1
@@ -120,12 +162,14 @@ class Runner:
                         StageRecord(judger_name=validate_name),
                     )
                     score = float(await self.validate.run(item, pool, validate_record))
+                    cancellation.check()
                 t_validate = time.monotonic() - t2
                 item.reward = score
 
                 item.status = RolloutStatus.COMPLETED
                 return item
         except Exception as exc:
+            cancellation.check()
             promoted = (
                 item.infer.error
                 or _first_validate_error(item)
@@ -139,8 +183,14 @@ class Runner:
             get_logger().error(f"[{tid}] traceback:\n{traceback.format_exc()}")
             return self._fail(item, promoted)
         finally:
-            self._log_final(tid, item, t_acquire, t_infer, t_validate)
-            await pool.release_all()
+            try:
+                await pool.release_all()
+            except CleanupError as exc:
+                self._fail(item, RolloutError(stage="cleanup", category=exc.kind, message=str(exc)))
+                raise
+            finally:
+                item.artifacts["sandbox_cleanup"] = pool.cleanup
+                self._log_final(tid, item, t_acquire, t_infer, t_validate)
 
     def _log_final(
         self,

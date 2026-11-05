@@ -21,10 +21,12 @@ from __future__ import annotations
 import asyncio
 import base64
 import io
+import math
 import os
 import random
 import re
 import shlex
+import sys
 import tarfile
 import time
 import traceback
@@ -37,6 +39,8 @@ import httpx
 from lagent.utils import create_object
 from lagent.utils.rate_limiter import get_shared_async_token_bucket
 
+from xtuner.v1.rl.agent_loop.sandbox_agent_loop.deadline import CancellationGuard
+from xtuner.v1.rl.agent_loop.sandbox_agent_loop.finalization import CleanupError, finalize_bounded
 from xtuner.v1.rl.agent_loop.sandbox_agent_loop.schemas import (
     AgentRolloutItem,
     EntryOutcome,
@@ -332,6 +336,7 @@ class DetachedShellEntry:
         poll_interval_sec: float = 60.0,
         pid_check_max_failures: int = 3,
         pid_check_retry_interval_sec: float = 10.0,
+        pid_check_recovery_timeout_sec: float = 120.0,
         rc_wait_timeout_sec: float = 10.0,
         rc_poll_interval_sec: float = 1.0,
         output_wait_timeout_sec: float = 5.0,
@@ -347,6 +352,9 @@ class DetachedShellEntry:
         self.poll_interval_sec = poll_interval_sec
         self.pid_check_max_failures = pid_check_max_failures
         self.pid_check_retry_interval_sec = pid_check_retry_interval_sec
+        self.pid_check_recovery_timeout_sec = pid_check_recovery_timeout_sec
+        if not 0 < pid_check_recovery_timeout_sec < float("inf"):
+            raise ValueError("pid_check_recovery_timeout_sec must be finite and positive")
         self.rc_wait_timeout_sec = rc_wait_timeout_sec
         self.rc_poll_interval_sec = rc_poll_interval_sec
         self.output_wait_timeout_sec = output_wait_timeout_sec
@@ -367,7 +375,8 @@ class DetachedShellEntry:
         with span(uid_obs, f"entry:{self.name}", entry_kind="DetachedShellEntry"):
             try:
                 outcome = await self._run_detached(client, item, entry, self.env)
-                await self._fill_output_files(client, entry, outcome.result)
+                if outcome.reason != "sandbox_unavailable":
+                    await self._fill_output_files(client, entry, outcome.result)
                 if not outcome.ok and self.failure is not None:
                     outcome = await self.failure.handle(client, item, record, entry, outcome)
                 self._finish_record(entry, outcome)
@@ -438,26 +447,133 @@ class DetachedShellEntry:
         polls = 0
         last_error: str | None = None
         pid_check_failures = 0
+        first_failure_at = None
+        pid_check_errors_total = 0
+        monitor_observations = []
+        last_failure = {}
+
+        def monitor_details():
+            return {
+                "pid_check_errors_total": pid_check_errors_total,
+                "monitor_observations": list(monitor_observations),
+            }
+
         while time.monotonic() <= deadline:
             polls += 1
             try:
-                running = await is_pid_running(pid)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                if first_failure_at is not None:
+                    remaining = min(
+                        remaining, first_failure_at + self.pid_check_recovery_timeout_sec - time.monotonic()
+                    )
+                    if remaining <= 0:
+                        break
+                running = await asyncio.wait_for(is_pid_running(pid), timeout=min(30.0, remaining))
+                completion_deadline = min(
+                    deadline,
+                    first_failure_at + self.pid_check_recovery_timeout_sec
+                    if first_failure_at is not None
+                    else deadline,
+                )
                 last_error = None
                 pid_check_failures = 0
-            except httpx.HTTPError as exc:
-                last_error = f"{type(exc).__name__}: {exc}"
+                first_failure_at = None
+            except (httpx.HTTPError, TimeoutError) as exc:
+                # Generic HTTP exceptions can contain credential-bearing URLs.
+                last_error = type(exc).__name__
+                if type(exc).__name__ == "DBoxTransportError":
+                    last_error += ": " + str(exc)  # Sanitized by the trusted adapter.
                 pid_check_failures += 1
-                if pid_check_failures >= self.pid_check_max_failures:
+                pid_check_errors_total += 1
+                if first_failure_at is None:
+                    first_failure_at = time.monotonic()
+                observation_deadline = min(deadline, first_failure_at + self.pid_check_recovery_timeout_sec)
+                sandbox_state = None
+                query_state = getattr(client, "get_lifecycle_state", None)
+                if query_state is not None and time.monotonic() < observation_deadline:
+                    try:
+                        sandbox_state = await asyncio.wait_for(
+                            query_state(), timeout=max(0.0, min(5.0, observation_deadline - time.monotonic()))
+                        )
+                    except (httpx.HTTPError, RuntimeError, TimeoutError):
+                        pass  # Failure to observe state never proves termination.
+                terminal = sandbox_state in {
+                    "error",
+                    "failed",
+                    "deleted",
+                    "deleting",
+                    "expired",
+                    "stopped",
+                    "stopping",
+                    "terminated",
+                    "terminating",
+                    "completed",
+                    "succeeded",
+                    "paused",
+                }
+                last_failure = {
+                    "sandbox_state": sandbox_state,
+                    "transport_status": getattr(exc, "status_code", None),
+                    "transport_error_code": getattr(exc, "error_code", None),
+                    "transport_phase": getattr(exc, "phase", None),
+                    "transport_error_type": getattr(exc, "transport_error_type", type(exc).__name__),
+                    "transport_elapsed_seconds": getattr(exc, "elapsed_seconds", None),
+                    "response_received": getattr(exc, "response_received", None),
+                    "error": last_error,
+                }
+                monitor_observations.append({"observed_at": time.time(), "poll": polls, **last_failure})
+                # Preserve the first failure and latest observations without an
+                # unbounded per-task diagnostic list.
+                if len(monitor_observations) > 32:
+                    del monitor_observations[1]
+                if not terminal and time.monotonic() < observation_deadline:
+                    try:
+                        rc = await asyncio.wait_for(
+                            self._read_int_capture_file(client, entry.rc_file),
+                            timeout=max(0.0, min(5.0, observation_deadline - time.monotonic())),
+                        )
+                    except TimeoutError:
+                        rc = None
+                    if rc is not None:
+                        return _entry_completed_outcome(
+                            source="detach_exec",
+                            return_code=rc,
+                            details={
+                                "pid": pid,
+                                "polls": polls,
+                                "completed_during_monitor_error": True,
+                                **monitor_details(),
+                            },
+                        )
+                recovery_expired = time.monotonic() - first_failure_at >= self.pid_check_recovery_timeout_sec
+                retryable_status = getattr(exc, "status_code", None)
+                if retryable_status is None and isinstance(exc, httpx.HTTPStatusError):
+                    retryable_status = exc.response.status_code
+                can_recover = sandbox_state in {"ready", "running"} and (
+                    retryable_status is None
+                    or retryable_status in {200, 404, 408, 409, 429}
+                    or retryable_status >= 500
+                )
+                if (
+                    terminal
+                    or recovery_expired
+                    or (not can_recover and pid_check_failures >= self.pid_check_max_failures)
+                ):
                     return EntryOutcome(
                         source="detach_exec",
-                        reason="pid_monitor_error",
+                        reason="sandbox_unavailable" if terminal else "pid_monitor_error",
                         retryable=True,
                         details={
                             "pid": pid,
                             "polls": polls,
                             "pid_check_failures": pid_check_failures,
                             "pid_check_retry_interval_sec": self.pid_check_retry_interval_sec,
-                            "error": last_error,
+                            "deadline_reached": time.monotonic() >= deadline,
+                            "recovery_deadline_reached": recovery_expired,
+                            **monitor_details(),
+                            **last_failure,
                         },
                         result=StageResult(
                             return_code=None,
@@ -465,20 +581,23 @@ class DetachedShellEntry:
                             error="detached entry pid monitor failed",
                         ),
                     )
-                retry_sleep = min(self.pid_check_retry_interval_sec, max(0.0, deadline - time.monotonic()))
+                retry_sleep = min(self.pid_check_retry_interval_sec, max(0.0, observation_deadline - time.monotonic()))
                 if retry_sleep > 0:
                     await asyncio.sleep(retry_sleep)
                 continue
 
             if not running:
+                completion_deadline = min(completion_deadline, time.monotonic() + self.rc_wait_timeout_sec)
                 rc = await self._wait_int_capture_file(
                     client,
                     entry.rc_file,
                     timeout_sec=self.rc_wait_timeout_sec,
                     poll_interval_sec=self.rc_poll_interval_sec,
+                    deadline=completion_deadline,
                 )
                 if rc is None:
-                    sandbox_alive = await _sandbox_alive(client)
+                    remaining = completion_deadline - time.monotonic()
+                    sandbox_alive = await _sandbox_alive(client, min(5.0, remaining)) if remaining > 0 else None
                     return EntryOutcome(
                         source="detach_exec",
                         reason="rc_missing",
@@ -489,6 +608,7 @@ class DetachedShellEntry:
                             "rc_wait_timeout_sec": self.rc_wait_timeout_sec,
                             "rc_poll_interval_sec": self.rc_poll_interval_sec,
                             "sandbox_alive": sandbox_alive,
+                            **monitor_details(),
                         },
                         result=StageResult(
                             return_code=None,
@@ -499,14 +619,27 @@ class DetachedShellEntry:
                 return _entry_completed_outcome(
                     source="detach_exec",
                     return_code=rc,
-                    details={"pid": pid, "polls": polls},
+                    details={"pid": pid, "polls": polls, **monitor_details()},
                 )
 
             sleep_sec = min(poll, max(0.0, deadline - time.monotonic()))
             if sleep_sec > 0:
                 await asyncio.sleep(sleep_sec)
 
-        rc = await self._read_int_capture_file(client, entry.rc_file)
+        # A healthy process observation permits the normal final rc check.
+        # An exhausted recovery window must not initiate another control RPC.
+        remaining = deadline - time.monotonic()
+        rc = (
+            await self._wait_int_capture_file(
+                client,
+                entry.rc_file,
+                timeout_sec=remaining,
+                poll_interval_sec=self.rc_poll_interval_sec,
+                deadline=deadline,
+            )
+            if last_error is None and remaining > 0
+            else None
+        )
         if rc is not None:
             return _entry_completed_outcome(
                 source="detach_exec",
@@ -518,7 +651,32 @@ class DetachedShellEntry:
                     "timeout_with_rc": True,
                     "last_pid_check_error": last_error,
                     "pid_check_failures": pid_check_failures,
+                    **monitor_details(),
                 },
+            )
+
+        # An unanswered process query cannot prove the agent exceeded its
+        # runtime. Keep persistent infrastructure failure distinct at deadline.
+        if last_error is not None:
+            return EntryOutcome(
+                source="detach_exec",
+                reason="pid_monitor_error",
+                retryable=True,
+                details={
+                    "pid": pid,
+                    "polls": polls,
+                    "pid_check_failures": pid_check_failures,
+                    "deadline_reached": time.monotonic() >= deadline,
+                    "recovery_deadline_reached": first_failure_at is not None
+                    and time.monotonic() >= first_failure_at + self.pid_check_recovery_timeout_sec,
+                    **monitor_details(),
+                    **last_failure,
+                },
+                result=StageResult(
+                    return_code=None,
+                    error="detached entry pid monitor failed",
+                    stderr=f"[{item.id}] entry {entry.name} could not observe pid {pid}: {last_error}",
+                ),
             )
 
         return EntryOutcome(
@@ -532,6 +690,7 @@ class DetachedShellEntry:
                 "last_pid_check_error": last_error,
                 "pid_check_failures": pid_check_failures,
                 "pid_check_retry_interval_sec": self.pid_check_retry_interval_sec,
+                **monitor_details(),
             },
             result=StageResult(
                 return_code=None,
@@ -558,11 +717,17 @@ class DetachedShellEntry:
         *,
         timeout_sec: float,
         poll_interval_sec: float,
+        deadline: float | None = None,
     ) -> int | None:
-        deadline = time.monotonic() + timeout_sec
+        deadline = (
+            min(deadline, time.monotonic() + timeout_sec) if deadline is not None else time.monotonic() + timeout_sec
+        )
         poll = max(0.1, poll_interval_sec)
-        while time.monotonic() <= deadline:
-            value = await self._read_int_capture_file(client, path)
+        while (remaining := deadline - time.monotonic()) > 0:
+            try:
+                value = await asyncio.wait_for(self._read_int_capture_file(client, path), timeout=remaining)
+            except asyncio.TimeoutError:
+                return None
             if value is not None:
                 return value
             sleep_sec = min(poll, max(0.0, deadline - time.monotonic()))
@@ -600,8 +765,8 @@ class DetachedShellEntry:
     async def _wait_capture_file(self, client: Any, path: str) -> str | None:
         deadline = time.monotonic() + self.output_wait_timeout_sec
         poll = max(0.1, self.output_poll_interval_sec)
-        while time.monotonic() <= deadline:
-            value = await self._read_capture_file(client, path)
+        while (remaining := deadline - time.monotonic()) > 0:
+            value = await self._read_capture_file(client, path, timeout_sec=min(5.0, remaining))
             if value is not None:
                 return value
             sleep_sec = min(poll, max(0.0, deadline - time.monotonic()))
@@ -677,6 +842,7 @@ class SandboxStage:
         self.hook_stuck_warn_sec = hook_stuck_warn_sec
 
     async def run(self, client: Any, item: AgentRolloutItem, record: StageRecord) -> StageResult:
+        cancellation = CancellationGuard()
         record.status = StageStatus.RUNNING
         record.started_at = record.started_at or time.monotonic()
         stage_label = record.judger_name or "infer"
@@ -687,6 +853,7 @@ class SandboxStage:
             result = StageResult()
             for entry in self.entries:
                 outcome = await entry.run(client, item, record)
+                cancellation.check()
                 result = outcome.result
                 self._apply_result(record, result, stage_label)
                 if not outcome.ok:
@@ -733,6 +900,7 @@ class SandboxStage:
         stage_label: str,
     ) -> None:
         hook_name = ""
+        cancellation = CancellationGuard()
         try:
             for hook in hooks:
                 hook_name = getattr(hook, "name", hook.__class__.__name__)
@@ -744,6 +912,7 @@ class SandboxStage:
                     phase=phase,
                     stuck_warn_sec=self.hook_stuck_warn_sec,
                 )
+                cancellation.check()
         except Exception as exc:
             record.status = StageStatus.FAILED
             record.error = record.error or RolloutError(
@@ -844,6 +1013,14 @@ class SandboxPool:
       - the primary ``client`` / ``env_id`` / ``url`` triplet per public name
       - sandbox-name validation against the configured spec map
 
+    Cleanup is bounded by ``cleanup_timeout_sec`` (default 120 seconds), plus
+    a cancellation grace of at most one second. Deletes and retries precede
+    connection closure; results are available in ``cleanup``. ``close_provider``
+    defaults to true for dict configurations and false for shared instances.
+    Set it explicitly only for a provider dedicated to this pool. Optional
+    ``verify_deletion`` queries final lifecycle states when the provider supports
+    it. Tasks otherwise retain their own workload and verification budgets.
+
     Providers create and delete exactly one physical sandbox per call. They
     must not manage dependency groups or close returned clients.  An optional
     spec provisioner runs only after every member is healthy and must restrict
@@ -864,7 +1041,22 @@ class SandboxPool:
         creates_per_sec: float | None = 3.0,
         creates_burst: int = 1,
         create_rate_limit_key: str = "xtuner.sandbox_agent_loop.sandbox_acquire",
+        cleanup_timeout_sec: float = 120.0,
+        close_provider: bool | None = None,
+        verify_deletion: bool = False,
     ):
+        if not math.isfinite(cleanup_timeout_sec) or cleanup_timeout_sec <= 0:
+            raise ValueError("cleanup_timeout_sec must be finite and positive")
+        self._cleanup_timeout_sec = cleanup_timeout_sec
+        # A passed instance may serve other pools. Only a dedicated provider
+        # may donate orphaned creates or be closed by this pool.
+        self._close_provider = isinstance(provider, dict) if close_provider is None else close_provider
+        self._verify_deletion = verify_deletion
+        self.cleanup: dict[str, Any] = {"ok": False, "error_kind": None}
+        self._cleanup_clients: list[Any] = []
+        self._pending_delete_ids: set[str] = set()
+        self._pending_verification_ids: set[str] = set()
+        self._releasing = False
         self._provider = create_object(provider)
         self._specs: dict[str, SandboxSpec] = {name: create_object(spec) for name, spec in specs.items()}
         self._provisioners = {
@@ -929,15 +1121,96 @@ class SandboxPool:
         return self._specs[name]
 
     async def release_all(self) -> None:
-        for name in list(reversed(self._clients)):
-            client = self._clients.pop(name)
-            env_id = self._env_ids.pop(name, None)
-            self._urls.pop(name, None)
-            group = self._groups.pop(name, None)
-            if group is None and env_id is not None:
-                group = [_SandboxLease(name="primary", client=client, env_id=env_id)]
-            if group:
-                await self._release_group(name, group)
+        if (
+            self.cleanup.get("ok")
+            and not self._clients
+            and not self._pending_delete_ids
+            and not self._pending_verification_ids
+        ):
+            return
+        self._releasing = True
+        primary_exception = sys.exc_info()[1]
+        self.cleanup.update(ok=False, error_kind=None, resources_deleted=False, clients_closed=False)
+        seconds = self._cleanup_timeout_sec
+        started = time.monotonic()
+        # First deletion pass, retry pass and final observation share the outer
+        # deadline, leaving a final slice for closing HTTP connections.
+        self._release_delete_deadline = started + seconds * 0.4
+
+        async def release() -> None:
+            owned_ids = self._owned_orphan_ids()
+            owned_ids.update(self._pending_delete_ids)
+            owned_ids.update(self._pending_verification_ids)
+            owned_ids.update(lease.env_id for group in self._groups.values() for lease in group)
+            query = getattr(self._provider, "get", None)
+            if self._verify_deletion and query is not None:
+                # Deletion acceptance and confirmed termination are separate.
+                # Register before any await so failed/cancelled passes cannot
+                # lose IDs when leases or provider ownership are released.
+                self._pending_verification_ids.update(owned_ids)
+            try:
+                self.cleanup["phase"] = "delete_sandboxes"
+                await self._release_groups()
+                retry_ids = self._pending_delete_ids | self._owned_orphan_ids()
+                self.cleanup["phase"] = "retry_deletions"
+                await self._delete_pass(sorted(retry_ids), started + seconds * 0.8)
+                if self._pending_delete_ids:
+                    raise RuntimeError("Sandbox deletion not confirmed")
+                self.cleanup["phase"] = "verify_deletion"
+                if self._verify_deletion and query is not None:
+                    final_states = []
+                    for index, env_id in enumerate(sorted(owned_ids)):
+                        remaining = started + seconds * 0.95 - time.monotonic()
+                        if remaining <= 0:
+                            raise CleanupError("cleanup_timeout", "verify_deletion")
+                        response = await finalize_bounded(
+                            query(env_id),
+                            timeout_seconds=remaining / (len(owned_ids) - index) / 1.1,
+                            diagnostic={"phase": "verify_deletion", "env_id": env_id},
+                        )
+                        status = response.get("env", response).get("status")
+                        final_states.append({"env_id": env_id, "status": status})
+                        if status != "deleted":
+                            raise RuntimeError("Sandbox final state is not deleted")
+                        self._pending_verification_ids.discard(env_id)
+                    self.cleanup["final_states"] = final_states
+                self.cleanup["resources_deleted"] = True
+            except Exception:
+                self.cleanup["failure_phase"] = self.cleanup["phase"]
+                raise
+            finally:
+                self.cleanup["phase"] = "close_clients"
+                clients = list(self._cleanup_clients)
+
+                async def close_client(client: Any) -> None:
+                    await client.aclose()
+                    self._cleanup_clients.remove(client)
+                    self.cleanup["closed_client_count"] = self.cleanup.get("closed_client_count", 0) + 1
+
+                operations = [close_client(client) for client in clients]
+                close = getattr(self._provider, "aclose", None) if self._close_provider else None
+                if close is not None:
+
+                    async def close_provider() -> None:
+                        await close()
+                        self.cleanup["provider_closed"] = True
+
+                    operations.append(close_provider())
+                else:
+                    self.cleanup["provider_closed"] = self._close_provider
+                outcomes = await asyncio.gather(*operations, return_exceptions=True)
+                self.cleanup["clients_closed"] = not any(isinstance(value, BaseException) for value in outcomes)
+                if not self.cleanup["clients_closed"]:
+                    raise RuntimeError("Sandbox HTTP client closure not confirmed")
+
+        try:
+            await finalize_bounded(release(), timeout_seconds=seconds, diagnostic=self.cleanup)
+        except CleanupError:
+            if primary_exception is None:
+                raise
+        finally:
+            self.cleanup["unverified_env_ids"] = sorted(self._pending_verification_ids)
+            self._releasing = False
 
     @staticmethod
     def _url_of(client: Any) -> str | None:
@@ -980,15 +1253,11 @@ class SandboxPool:
                     record.metadata["sandbox_create_to_ready_time_s"] = time.monotonic() - t_ready
                 return group
             except asyncio.CancelledError:
-                cleanup = asyncio.create_task(self._release_group(name, group))
-                try:
-                    await asyncio.shield(cleanup)
-                except asyncio.CancelledError:
-                    await cleanup
+                await self._rollback_group(name, group)
                 raise
             except Exception as exc:
                 last_err = exc
-                await self._release_group(name, group)
+                await self._rollback_group(name, group)
                 if attempt < self._max_attempts:
                     await asyncio.sleep(min(2**attempt, 8))
 
@@ -1022,22 +1291,113 @@ class SandboxPool:
             **create_kwargs,
         )
 
+    async def _rollback_group(self, name: str, group: list[_SandboxLease]) -> None:
+        diagnostic: dict[str, Any] = {"name": name, "phase": "acquire_rollback"}
+        self.cleanup.setdefault("acquire_rollbacks", []).append(diagnostic)
+        try:
+            await finalize_bounded(
+                self._release_group(name, group), timeout_seconds=self._cleanup_timeout_sec, diagnostic=diagnostic
+            )
+        except CleanupError:
+            # Preserve the acquisition failure; release_all retries retained
+            # leases and sockets. Repeated cancellation cannot skip this pass.
+            pass
+
+    async def _release_groups(self) -> None:
+        for name in list(reversed(self._clients)):
+            client = self._clients.pop(name)
+            env_id = self._env_ids.pop(name, None)
+            self._urls.pop(name, None)
+            group = self._groups.pop(name, None)
+            if group is None and env_id is not None:
+                group = [_SandboxLease(name="primary", client=client, env_id=env_id)]
+            if group:
+                await self._release_group(name, group)
+
+    async def _delete_pass(self, env_ids: list[str], deadline: float) -> None:
+        env_ids = list(dict.fromkeys(env_ids))
+        for index, env_id in enumerate(env_ids):
+            self._pending_delete_ids.add(env_id)
+            remaining = deadline - time.monotonic()
+            diagnostic = {"env_id": env_id, "phase": "delete_sandbox"}
+            self.cleanup.setdefault("delete_attempts", []).append(diagnostic)
+            if remaining <= 0:
+                diagnostic.update(ok=False, error_kind="delete_budget_exhausted")
+                continue
+            # Include finalize_bounded's cancellation grace in this member's
+            # share. A stalled primary must leave time to delete dependencies.
+            share = remaining / (len(env_ids) - index)
+            try:
+                await finalize_bounded(
+                    self._provider.delete(env_id),
+                    timeout_seconds=share / 1.1,
+                    diagnostic=diagnostic,
+                )
+            except CleanupError:
+                continue
+            self._pending_delete_ids.discard(env_id)
+
     async def _release_group(self, name: str, group: list[_SandboxLease]) -> None:
-        for lease in reversed(group):
-            try:
-                await self._provider.delete(lease.env_id)
-            except Exception as exc:
-                get_logger().warning(
-                    f"gateway delete failed for sandbox {name} member={lease.name} env_id={lease.env_id}:\n"
-                    f"{''.join(traceback.format_exception(type(exc), exc, exc.__traceback__)).rstrip()}"
+        # A stalled HTTP close must not prevent deleting the next dependency.
+        # Preserve reverse dependency deletion, then close clients independently.
+        leases = list(reversed(group))
+        self._cleanup_clients.extend(lease.client for lease in leases)
+        diagnostic = {"name": name, "phase": "delete_sandboxes"}
+        self.cleanup.setdefault("group_releases", []).append(diagnostic)
+        seconds = self._cleanup_timeout_sec
+        deadline = getattr(self, "_release_delete_deadline", time.monotonic() + seconds * 0.4)
+        env_ids = [lease.env_id for lease in leases]
+        self._pending_delete_ids.update(env_ids)
+        try:
+            # Also called by upstream while unwinding a partial acquisition,
+            # before Runner reaches release_all(). Never replace its primary
+            # cancellation/error; owned IDs are retried by the final pool pass.
+            await finalize_bounded(
+                self._delete_pass(env_ids, deadline),
+                timeout_seconds=max(0.001, deadline - time.monotonic()) * 1.1,
+                diagnostic=diagnostic,
+            )
+        except CleanupError:
+            pass
+        if self._pending_delete_ids.intersection(env_ids):
+            diagnostic.update(
+                ok=False,
+                error_kind="cleanup_timeout"
+                if any(
+                    row.get("error_kind") == "cleanup_timeout" and row["env_id"] in env_ids
+                    for row in self.cleanup.get("delete_attempts", [])
                 )
+                else "delete_failed",
+            )
+
+        if not self._releasing:
+            retry_ids = self._pending_delete_ids.intersection(env_ids)
+            await self._delete_pass(sorted(retry_ids), time.monotonic() + seconds * 0.4)
+            # Acquisition rollback must release sockets even when callers use
+            # Pool.get directly and never reach Runner's final release.
+            clients = [lease.client for lease in leases]
+
+            async def close_rollback() -> None:
+                outcomes = await asyncio.gather(*(client.aclose() for client in clients), return_exceptions=True)
+                for client, outcome in zip(clients, outcomes):
+                    if not isinstance(outcome, BaseException):
+                        self._cleanup_clients.remove(client)
+                if any(isinstance(value, BaseException) for value in outcomes):
+                    raise RuntimeError("Sandbox rollback client closure failed")
+
             try:
-                await lease.client.aclose()
-            except Exception as exc:
-                get_logger().warning(
-                    f"client aclose failed for sandbox {name} member={lease.name} env_id={lease.env_id}:\n"
-                    f"{''.join(traceback.format_exception(type(exc), exc, exc.__traceback__)).rstrip()}"
+                await finalize_bounded(
+                    close_rollback(),
+                    timeout_seconds=seconds * 0.2,
+                    diagnostic=diagnostic.setdefault("close", {}),
                 )
+            except CleanupError:
+                # Keep failed clients for the final release, preserving the
+                # acquisition exception that caused rollback.
+                pass
+
+    def _owned_orphan_ids(self) -> set[str]:
+        return set(getattr(self._provider, "owned_env_ids", ())) if self._close_provider else set()
 
     async def _wait_healthy(self, client: Any) -> bool:
         deadline = time.monotonic() + self._health_max_wait_sec
@@ -1209,6 +1569,6 @@ def _entry_completed_outcome(
 
 
 def _outcome_error_category(outcome: EntryOutcome) -> str:
-    if outcome.reason in {"timeout", "pid_monitor_error", "rc_missing"}:
+    if outcome.reason in {"timeout", "pid_monitor_error", "sandbox_unavailable", "rc_missing"}:
         return outcome.reason
     return outcome.reason or "entry"
